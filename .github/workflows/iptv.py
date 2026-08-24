@@ -6,7 +6,6 @@ import json
 from collections import Counter, defaultdict
 import re
 from typing import Dict, Iterable, List, Optional, Set, Tuple, Any
-from urllib.parse import urljoin
 
 def contains_date(text):
     """
@@ -28,10 +27,6 @@ CONFIG = {
     "timeout": 10,  # Timeout in seconds
     "max_parallel": 30,  # Max concurrent requests
     "output_file": "best_sorted.m3u",  # Output file for the sorted M3U
-    "probe_seconds": 2.5,  # 测速下载时长（秒）
-    "probe_max_bytes": 2 * 1024 * 1024,  # 测速最多下载字节
-    "min_smooth_kbps": 800,  # 未知码率时的最低流畅带宽（kbps，约 720p+）
-    "smooth_margin": 1.3,  # 吞吐需达到码率的倍数才算流畅
 }
 
 CHAR_NORMALIZATION_MAP = str.maketrans({
@@ -244,7 +239,7 @@ IGNORED_GEO_NAMES_NORMALIZED = {
 }
 
 BLOCKED_M3U_KEYWORDS = (
-    "更新时间", "更新時間", "维护时间", "維護時間", "维护内容", "維護内容", "維護內容",
+    "更新时间", "更新時間", "维护时间", "維護時間", "维护内容", "維護内容", "维护內容",
     "公告说明", "公告說明", "公告", "说明", "說明", "支持作者", "支持打赏", "支持打賞",
     "免费订阅", "免費訂閲", "免費訂閱", "温馨提示", "溫馨提示", "建議使用", "建议使用",
     "请勿贩卖", "請勿販賣", "请勿频繁切换", "請勿頻繁切換", "个人觀看", "個人觀看", "刀刀影院"
@@ -736,7 +731,7 @@ def deduplicate_candidate_entries(entries: Iterable[Dict[str, Any]]) -> List[Dic
     for entry in entries:
         channel = sanitize_channel_name(str(entry.get("channel", "")).strip())
         url = str(entry.get("url", "")).strip()
-        if not channel or channel == "Unknown" or not url.startswith(("http://", "https://")):
+        if not channel or not url.startswith(("http://", "https://")):
             continue
         if looks_like_notice_entry(channel, entry.get("source_group_title")):
             continue
@@ -754,72 +749,45 @@ def deduplicate_candidate_entries(entries: Iterable[Dict[str, Any]]) -> List[Dic
     return deduplicated
 
 
-def _entry_sort_key(entry: Dict[str, Any]) -> Tuple[Any, ...]:
-    """单个条目的排序键：流畅度 -> 吞吐带宽 -> 延迟 -> 是否 https -> URL 长度。"""
-    smooth = 1 if entry.get("smooth") else 0
-    throughput = entry.get("throughput_kbps")
-    throughput = throughput if isinstance(throughput, (int, float)) else 0.0
-    latency = entry.get("latency")
-    latency = latency if isinstance(latency, (int, float)) else float("inf")
-    https = 0 if str(entry.get("url", "")).startswith("https://") else 1
-    return (-smooth, -throughput, latency, https, len(str(entry.get("url", ""))))
-
-
-def _pick_channel_name(entries: List[Dict[str, Any]]) -> str:
-    """从同键条目里挑一个最可信的显示名（最常见、非 Unknown）。"""
-    names = Counter(
-        sanitize_channel_name(str(e.get("channel", "")).strip())
-        for e in entries
-        if e.get("channel")
+def choose_better_entry(current_best: Dict[str, Any], candidate: Dict[str, Any]) -> Dict[str, Any]:
+    best_latency = current_best.get("latency")
+    cand_latency = candidate.get("latency")
+    best_score = (
+        best_latency if isinstance(best_latency, (int, float)) else float("inf"),
+        0 if str(current_best.get("url", "")).startswith("https://") else 1,
+        len(str(current_best.get("url", ""))),
     )
-    for name, _ in names.most_common():
-        if name and name != "Unknown":
-            return name
-    return names.most_common(1)[0][0] if names else "Unknown"
+    cand_score = (
+        cand_latency if isinstance(cand_latency, (int, float)) else float("inf"),
+        0 if str(candidate.get("url", "")).startswith("https://") else 1,
+        len(str(candidate.get("url", ""))),
+    )
+    return candidate if cand_score < best_score else current_best
 
 
-def select_best_streams(
-    valid_entries: Iterable[Dict[str, Any]],
-    max_urls_per_channel: int = 3,
-) -> List[Dict[str, Any]]:
+def select_best_streams(valid_entries: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     去重并选优：
     1) 同频道同 URL 去重
-    2) 多源一致性交叉验证：某 URL 被 >= 2 个不同上游源同时给出才优先采信，
-       避免单一来源的错误标签（如把别台流标成 CCTV14）污染结果
-    3) 无共识时回退到所有候选里按延迟/https 选
-    4) 每频道保留最多 max_urls_per_channel 个 URL 作为备用
+    2) 同频道保留最低延迟（并优先 https）的最佳 URL
     """
-    by_channel: Dict[str, List[Dict[str, Any]]] = {}
+    best_by_channel: Dict[str, Dict[str, Any]] = {}
+
     for entry in valid_entries:
         channel = sanitize_channel_name(str(entry.get("channel", "")).strip())
         url = str(entry.get("url", "")).strip()
-        if not channel or channel == "Unknown":
+        if not channel or not url:
             continue
-        if not url.startswith(("http://", "https://")):
-            continue
-        by_channel.setdefault(channel_identity_key(channel), []).append(entry)
 
-    selected: List[Dict[str, Any]] = []
-    for entries in by_channel.values():
-        url_groups: Dict[str, List[Dict[str, Any]]] = {}
-        for e in entries:
-            url_groups.setdefault(e["url"], []).append(e)
+        key = channel_identity_key(channel)
+        current = best_by_channel.get(key)
+        if current is None:
+            best_by_channel[key] = dict(entry)
+        else:
+            best_by_channel[key] = choose_better_entry(current, entry)
 
-        def source_count(url: str) -> int:
-            return len({e.get("source", "") for e in url_groups[url] if e.get("source")})
-
-        consensus = [u for u in url_groups if source_count(u) >= 2]
-        pool = consensus if consensus else list(url_groups.keys())
-        pool.sort(key=lambda u: min(_entry_sort_key(e) for e in url_groups[u]))
-
-        chosen_urls = pool[:max_urls_per_channel]
-        selected.append({
-            "channel": _pick_channel_name(entries),
-            "urls": chosen_urls,
-        })
-
-    selected.sort(key=lambda x: natural_sort_key(str(x["channel"])))
+    selected = list(best_by_channel.values())
+    selected.sort(key=lambda x: natural_sort_key(str(x.get("channel", ""))))
     return selected
 
 
@@ -871,167 +839,21 @@ def extract_urls_from_m3u(content):
     return urls
 
 
-def _looks_like_error_payload(content_type: str, chunk: bytes) -> bool:
-    """判断返回内容是否为 HTML/JSON 错误页（反爬拦截页、错误提示等），而非真实流。"""
-    ct = (content_type or "").lower()
-    if "text/html" in ct or "application/xhtml" in ct:
-        return True
-    if not chunk:
-        return False
-    head = chunk[:256].lstrip()
-    first = head[:1]
-    # m3u8/txt 以 # 开头，TS/FLV 为二进制；以 < { [ 开头的几乎都是 HTML/JSON 错误页
-    if first in (b"<", b"{", b"["):
-        return True
-    low = head[:64].lower()
-    if low.startswith(b"<html") or low.startswith(b"<!doctype"):
-        return True
-    return False
-
-
-def _resolve_url(base_url: str, ref: str) -> str:
-    """把 m3u8 里的相对分片地址解析为绝对地址。"""
-    if ref.startswith(("http://", "https://")):
-        return ref
-    return urljoin(base_url, ref)
-
-
-def _parse_m3u8_media(text: bytes, base_url: str) -> Tuple[Optional[float], Optional[str], Optional[float]]:
-    """
-    从 m3u8 播放列表里提取：(分片时长秒, 第一个分片绝对URL, 码率kbps)。
-    变体列表(无直接分片)时返回 (None, None, 码率kbps)。
-    """
-    content = text.decode("utf-8", "ignore")
-    bitrate_kbps = None
-    m = re.search(r"BANDWIDTH=(\d+)", content, re.I)
-    if m:
-        bitrate_kbps = int(m.group(1)) / 1000.0
-
-    duration = None
-    segment = None
-    pending = None
-    saw_stream_inf = False
-    for line in content.splitlines():
-        line = line.strip()
-        if line.upper().startswith("#EXT-X-STREAM-INF"):
-            saw_stream_inf = True
-            continue
-        mm = re.match(r"#EXTINF:\s*([\d.]+)", line)
-        if mm:
-            pending = float(mm.group(1))
-            continue
-        if line.startswith("#") or not line:
-            continue
-        if saw_stream_inf:
-            # 变体列表：第一个非注释行是子 m3u8，不作为媒体分片
-            return None, None, bitrate_kbps
-        if pending is not None:
-            duration = pending
-        segment = line
-        break
-
-    if not segment:
-        return None, None, bitrate_kbps
-    return duration, _resolve_url(base_url, segment), bitrate_kbps
-
-
-async def _read_until_error(response, n: int) -> bytes:
-    try:
-        return await response.content.read(n)
-    except Exception:
-        return b""
-
-
-async def _measure_throughput(response) -> Optional[float]:
-    """持续下载最多 probe_seconds 秒 / probe_max_bytes 字节，返回吞吐量 kbps。"""
-    downloaded = 0
-    dl_start = time.time()
-    deadline = dl_start + CONFIG["probe_seconds"]
-    while downloaded < CONFIG["probe_max_bytes"] and time.time() < deadline:
-        try:
-            chunk = await asyncio.wait_for(
-                response.content.read(65536),
-                timeout=max(0.05, deadline - time.time()),
-            )
-        except asyncio.TimeoutError:
-            break
-        except Exception:
-            break
-        if not chunk:
-            break
-        downloaded += len(chunk)
-    elapsed = time.time() - dl_start
-    if elapsed <= 0:
-        elapsed = 1e-6
-    return (downloaded * 8) / 1024 / elapsed
-
-
-def _judge_smooth(throughput_kbps: Optional[float], bitrate_kbps: Optional[float]) -> bool:
-    """判断吞吐是否够流畅：知道码率则要求吞吐 >= 码率*系数；否则用最低带宽阈值。"""
-    if throughput_kbps is None:
-        return True  # 测不到不判死
-    if bitrate_kbps:
-        return throughput_kbps >= bitrate_kbps * CONFIG["smooth_margin"]
-    return throughput_kbps >= CONFIG["min_smooth_kbps"]
-
-
-# 测试 IPTV 链接的可用性、延迟和流畅度（吞吐带宽）
+# 测试 IPTV 链接的可用性和速度
 async def test_stream(session: aiohttp.ClientSession, semaphore: asyncio.Semaphore, url: str):
-    """测试 IPTV 链接：返回 (是否可用, 延迟s, 吞吐kbps, 码率kbps)。"""
+    """测试 IPTV 链接的可用性和速度"""
     async with semaphore:
         start_time = time.time()
         try:
             async with session.get(url, timeout=CONFIG["timeout"]) as response:
-                if response.status != 200:
-                    return False, None, None, None
-                content_type = response.headers.get("Content-Type", "")
-                chunk = await _read_until_error(response, 1024)
-                if _looks_like_error_payload(content_type, chunk):
-                    return False, None, None, None
-                latency = time.time() - start_time
-
-                is_m3u = ("mpegurl" in (content_type or "").lower()) or chunk.lstrip().startswith(b"#EXTM3U")
-                if not is_m3u:
-                    # 直接流：对源本身测吞吐
-                    throughput = await _measure_throughput(response)
-                    return True, latency, throughput, None
-
-                # m3u8：读完播放列表，再去测真实分片的下行速度
-                try:
-                    rest = await response.content.read(32768)
-                except Exception:
-                    rest = b""
-                playlist = chunk + rest
-
-            duration, seg_url, bitrate = _parse_m3u8_media(playlist, url)
-            if seg_url:
-                try:
-                    async with session.get(seg_url, timeout=CONFIG["timeout"]) as r2:
-                        if r2.status != 200:
-                            return False, None, None, None
-                        h2 = await _read_until_error(r2, 1024)
-                        if _looks_like_error_payload(r2.headers.get("Content-Type", ""), h2):
-                            return False, None, None, None
-                        throughput = await _measure_throughput(r2)
-                        return True, latency, throughput, bitrate
-                except Exception:
-                    return False, None, None, None
-
-            # 变体列表无分片：对播放列表本身测速（不精确，但不至于误杀）
-            try:
-                async with session.get(url, timeout=CONFIG["timeout"]) as r3:
-                    if r3.status == 200:
-                        throughput = await _measure_throughput(r3)
-                        return True, latency, throughput, bitrate
-            except Exception:
-                pass
-            return True, latency, None, bitrate
-
+                if response.status == 200:
+                    elapsed_time = time.time() - start_time
+                    return True, elapsed_time
+                return False, None
         except asyncio.TimeoutError:
-            return False, None, None, None
+            return False, None
         except Exception:
-            return False, None, None, None
-
+            return False, None
 
 
 # 测试多个 IPTV 链接
@@ -1064,23 +886,17 @@ async def read_and_test_file(
             entries = extract_urls_from_m3u(content)
         else:
             entries = extract_urls_from_txt(content)
-        for entry in entries:
-            entry["source"] = file_path
         entries = deduplicate_candidate_entries(entries)
 
         valid_entries: List[Dict[str, Any]] = []
         results = await test_multiple_streams(session, semaphore, entries)
-        for (is_valid, latency, throughput, bitrate), entry in zip(results, entries):
+        for (is_valid, latency), entry in zip(results, entries):
             if is_valid:
                 valid_entries.append({
                     "channel": entry["channel"],
                     "url": entry["url"],
                     "source_group_title": entry.get("source_group_title"),
-                    "source": entry.get("source"),
                     "latency": latency,
-                    "throughput_kbps": throughput,
-                    "bitrate_kbps": bitrate,
-                    "smooth": _judge_smooth(throughput, bitrate),
                 })
 
         return valid_entries
@@ -1104,13 +920,13 @@ def generate_sorted_m3u(valid_entries, cctv_channels, province_channels, filenam
 
     for entry in valid_entries:
         channel = str(entry.get("channel", "")).strip()
-        urls = [str(u).strip() for u in (entry.get("urls") or []) if str(u).strip()]
+        url = str(entry.get("url", "")).strip()
         source_group_title = entry.get("source_group_title")
-        if not channel or not urls:
+        if not channel or not url:
             continue
 
-        if contains_date(channel) or any(contains_date(u) for u in urls):
-            continue  # 过滤掉包含日期格式的频道/地址
+        if contains_date(channel) or contains_date(url):
+            continue  # 过滤掉包含日期格式的频道
 
         normalized_channel = normalize_text_for_match(normalize_cctv_name(channel))
         upstream_group = infer_group_from_upstream_title(source_group_title, province_matchers)
@@ -1119,14 +935,14 @@ def generate_sorted_m3u(valid_entries, cctv_channels, province_channels, filenam
         if is_cctv_channel(channel, normalized_channel, normalized_cctv_channels) or upstream_group == "央视频道":
             cctv_channels_list.append({
                 "channel": channel,
-                "urls": urls,
+                "url": url,
                 "logo": f"https://live.fanmingming.cn/tv/{channel}.png",
                 "group_title": "央视频道"
             })
         elif "卫视" in channel or upstream_group == "卫视频道":  # 卫视频道
             satellite_channels.append({
                 "channel": channel,
-                "urls": urls,
+                "url": url,
                 "logo": f"https://live.fanmingming.cn/tv/{channel}.png",
                 "group_title": "卫视频道"
             })
@@ -1135,7 +951,7 @@ def generate_sorted_m3u(valid_entries, cctv_channels, province_channels, filenam
             if province:
                 province_channels_list[province].append({
                     "channel": channel,
-                    "urls": urls,
+                    "url": url,
                     "logo": f"https://live.fanmingming.cn/tv/{channel}.png",
                     "group_title": f"{province}"
                 })
@@ -1144,14 +960,14 @@ def generate_sorted_m3u(valid_entries, cctv_channels, province_channels, filenam
                 if smart_category and smart_category in SMART_CATEGORY_KEYWORDS:
                     smart_category_channels[smart_category].append({
                         "channel": channel,
-                        "urls": urls,
+                        "url": url,
                         "logo": f"https://live.fanmingming.cn/tv/{channel}.png",
                         "group_title": smart_category
                     })
                 else:
                     other_channels.append({
                         "channel": channel,
-                        "urls": urls,
+                        "url": url,
                         "logo": f"https://live.fanmingming.cn/tv/{channel}.png",
                         "group_title": "其他频道"
                     })
@@ -1188,8 +1004,7 @@ def generate_sorted_m3u(valid_entries, cctv_channels, province_channels, filenam
             for channel_info in all_channels:
                 f.write(
                     f"#EXTINF:-1 tvg-name=\"{channel_info['channel']}\" tvg-logo=\"{channel_info['logo']}\" group-title=\"{channel_info['group_title']}\",{channel_info['channel']}\n")
-                for url in channel_info["urls"]:
-                    f.write(f"{url}\n")
+                f.write(f"{channel_info['url']}\n")
 
 def load_province_channels(files):
     """加载多个省份的频道列表"""
