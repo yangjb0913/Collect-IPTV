@@ -27,6 +27,10 @@ CONFIG = {
     "timeout": 10,  # Timeout in seconds
     "max_parallel": 30,  # Max concurrent requests
     "output_file": "best_sorted.m3u",  # Output file for the sorted M3U
+    "probe_seconds": 2.5,  # 测速下载时长（秒）
+    "probe_max_bytes": 2 * 1024 * 1024,  # 测速最多下载字节
+    "min_smooth_kbps": 800,  # 未知码率时的最低流畅带宽（kbps，约 720p+）
+    "smooth_margin": 1.3,  # 吞吐需达到码率的倍数才算流畅
 }
 
 CHAR_NORMALIZATION_MAP = str.maketrans({
@@ -239,7 +243,7 @@ IGNORED_GEO_NAMES_NORMALIZED = {
 }
 
 BLOCKED_M3U_KEYWORDS = (
-    "更新时间", "更新時間", "维护时间", "維護時間", "维护内容", "維護内容", "维护內容",
+    "更新时间", "更新時間", "维护时间", "維護時間", "维护内容", "維護内容", "維護內容",
     "公告说明", "公告說明", "公告", "说明", "說明", "支持作者", "支持打赏", "支持打賞",
     "免费订阅", "免費訂閲", "免費訂閱", "温馨提示", "溫馨提示", "建議使用", "建议使用",
     "请勿贩卖", "請勿販賣", "请勿频繁切换", "請勿頻繁切換", "个人觀看", "個人觀看", "刀刀影院"
@@ -749,20 +753,19 @@ def deduplicate_candidate_entries(entries: Iterable[Dict[str, Any]]) -> List[Dic
     return deduplicated
 
 
+def _entry_score(entry: Dict[str, Any]) -> Tuple[Any, ...]:
+    """流畅度优先：流畅(吞吐/码率达标) -> 吞吐带宽 -> 延迟 -> 是否 https -> URL 长度。"""
+    smooth = 0 if entry.get("smooth") else 1
+    throughput = entry.get("throughput_kbps")
+    throughput = -(throughput if isinstance(throughput, (int, float)) else 0.0)
+    latency = entry.get("latency")
+    latency = latency if isinstance(latency, (int, float)) else float("inf")
+    https = 0 if str(entry.get("url", "")).startswith("https://") else 1
+    return (smooth, throughput, latency, https, len(str(entry.get("url", ""))))
+
+
 def choose_better_entry(current_best: Dict[str, Any], candidate: Dict[str, Any]) -> Dict[str, Any]:
-    best_latency = current_best.get("latency")
-    cand_latency = candidate.get("latency")
-    best_score = (
-        best_latency if isinstance(best_latency, (int, float)) else float("inf"),
-        0 if str(current_best.get("url", "")).startswith("https://") else 1,
-        len(str(current_best.get("url", ""))),
-    )
-    cand_score = (
-        cand_latency if isinstance(cand_latency, (int, float)) else float("inf"),
-        0 if str(candidate.get("url", "")).startswith("https://") else 1,
-        len(str(candidate.get("url", ""))),
-    )
-    return candidate if cand_score < best_score else current_best
+    return candidate if _entry_score(candidate) < _entry_score(current_best) else current_best
 
 
 def select_best_streams(valid_entries: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -839,21 +842,156 @@ def extract_urls_from_m3u(content):
     return urls
 
 
-# 测试 IPTV 链接的可用性和速度
+def _looks_like_error_payload(content_type: str, chunk: bytes) -> bool:
+    """判断返回内容是否为 HTML/JSON 错误页，而非真实流。"""
+    ct = (content_type or "").lower()
+    if "text/html" in ct or "application/xhtml" in ct:
+        return True
+    if not chunk:
+        return False
+    head = chunk[:256].lstrip()
+    first = head[:1]
+    if first in (b"<", b"{", b"["):
+        return True
+    low = head[:64].lower()
+    if low.startswith(b"<html") or low.startswith(b"<!doctype"):
+        return True
+    return False
+
+
+def _resolve_url(base_url: str, ref: str) -> str:
+    from urllib.parse import urljoin
+    if ref.startswith(("http://", "https://")):
+        return ref
+    return urljoin(base_url, ref)
+
+
+def _parse_m3u8_media(text: bytes, base_url: str) -> Tuple[Optional[float], Optional[str], Optional[float]]:
+    """从 m3u8 提取 (分片时长秒, 第一个分片绝对URL, 码率kbps)。"""
+    content = text.decode("utf-8", "ignore")
+    bitrate_kbps = None
+    m = re.search(r"BANDWIDTH=(\d+)", content, re.I)
+    if m:
+        bitrate_kbps = int(m.group(1)) / 1000.0
+    duration = None
+    segment = None
+    pending = None
+    saw_stream_inf = False
+    for line in content.splitlines():
+        line = line.strip()
+        if line.upper().startswith("#EXT-X-STREAM-INF"):
+            saw_stream_inf = True
+            continue
+        mm = re.match(r"#EXTINF:\s*([\d.]+)", line)
+        if mm:
+            pending = float(mm.group(1))
+            continue
+        if line.startswith("#") or not line:
+            continue
+        if saw_stream_inf:
+            return None, None, bitrate_kbps
+        if pending is not None:
+            duration = pending
+        segment = line
+        break
+    if not segment:
+        return None, None, bitrate_kbps
+    return duration, _resolve_url(base_url, segment), bitrate_kbps
+
+
+async def _read_until_error(response, n: int) -> bytes:
+    try:
+        return await response.content.read(n)
+    except Exception:
+        return b""
+
+
+async def _measure_throughput(response) -> Optional[float]:
+    """持续下载最多 probe_seconds 秒 / probe_max_bytes 字节，返回吞吐量 kbps。"""
+    downloaded = 0
+    dl_start = time.time()
+    deadline = dl_start + CONFIG["probe_seconds"]
+    while downloaded < CONFIG["probe_max_bytes"] and time.time() < deadline:
+        try:
+            chunk = await asyncio.wait_for(
+                response.content.read(65536),
+                timeout=max(0.05, deadline - time.time()),
+            )
+        except asyncio.TimeoutError:
+            break
+        except Exception:
+            break
+        if not chunk:
+            break
+        downloaded += len(chunk)
+    elapsed = time.time() - dl_start
+    if elapsed <= 0:
+        elapsed = 1e-6
+    return (downloaded * 8) / 1024 / elapsed
+
+
+def _judge_smooth(throughput_kbps: Optional[float], bitrate_kbps: Optional[float]) -> bool:
+    """判断吞吐是否够流畅：知道码率则要求吞吐 >= 码率*系数；否则用最低带宽阈值。"""
+    if throughput_kbps is None:
+        return True  # 测不到不判死
+    if bitrate_kbps:
+        return throughput_kbps >= bitrate_kbps * CONFIG["smooth_margin"]
+    return throughput_kbps >= CONFIG["min_smooth_kbps"]
+
+
+# 测试 IPTV 链接的可用性、延迟和流畅度（吞吐带宽）
 async def test_stream(session: aiohttp.ClientSession, semaphore: asyncio.Semaphore, url: str):
-    """测试 IPTV 链接的可用性和速度"""
+    """测试 IPTV 链接：返回 (是否可用, 延迟s, 吞吐kbps, 码率kbps)。"""
     async with semaphore:
         start_time = time.time()
         try:
             async with session.get(url, timeout=CONFIG["timeout"]) as response:
-                if response.status == 200:
-                    elapsed_time = time.time() - start_time
-                    return True, elapsed_time
-                return False, None
+                if response.status != 200:
+                    return False, None, None, None
+                content_type = response.headers.get("Content-Type", "")
+                chunk = await _read_until_error(response, 1024)
+                if _looks_like_error_payload(content_type, chunk):
+                    return False, None, None, None
+                latency = time.time() - start_time
+
+                is_m3u = ("mpegurl" in (content_type or "").lower()) or chunk.lstrip().startswith(b"#EXTM3U")
+                if not is_m3u:
+                    throughput = await _measure_throughput(response)
+                    return True, latency, throughput, None
+
+                try:
+                    rest = await response.content.read(32768)
+                except Exception:
+                    rest = b""
+                playlist = chunk + rest
+
+            duration, seg_url, bitrate = _parse_m3u8_media(playlist, url)
+            if seg_url:
+                try:
+                    async with session.get(seg_url, timeout=CONFIG["timeout"]) as r2:
+                        if r2.status != 200:
+                            return False, None, None, None
+                        h2 = await _read_until_error(r2, 1024)
+                        if _looks_like_error_payload(r2.headers.get("Content-Type", ""), h2):
+                            return False, None, None, None
+                        throughput = await _measure_throughput(r2)
+                        return True, latency, throughput, bitrate
+                except Exception:
+                    return False, None, None, None
+
+            try:
+                async with session.get(url, timeout=CONFIG["timeout"]) as r3:
+                    if r3.status == 200:
+                        throughput = await _measure_throughput(r3)
+                        return True, latency, throughput, bitrate
+            except Exception:
+                pass
+            return True, latency, None, bitrate
+
         except asyncio.TimeoutError:
-            return False, None
+            return False, None, None, None
         except Exception:
-            return False, None
+            return False, None, None, None
 
 
 # 测试多个 IPTV 链接
@@ -890,13 +1028,16 @@ async def read_and_test_file(
 
         valid_entries: List[Dict[str, Any]] = []
         results = await test_multiple_streams(session, semaphore, entries)
-        for (is_valid, latency), entry in zip(results, entries):
+        for (is_valid, latency, throughput, bitrate), entry in zip(results, entries):
             if is_valid:
                 valid_entries.append({
                     "channel": entry["channel"],
                     "url": entry["url"],
                     "source_group_title": entry.get("source_group_title"),
                     "latency": latency,
+                    "throughput_kbps": throughput,
+                    "bitrate_kbps": bitrate,
+                    "smooth": _judge_smooth(throughput, bitrate),
                 })
 
         return valid_entries
