@@ -32,7 +32,6 @@ CONFIG = {
     "probe_max_bytes": 2 * 1024 * 1024,  # 测速最多下载字节
     "min_smooth_kbps": 800,  # 未知码率时的最低流畅带宽（kbps，约 720p+）
     "smooth_margin": 1.3,  # 吞吐需达到码率的倍数才算流畅
-    "use_ffprobe": True,  # 用 ffprobe 探测编码(可可靠识别 H.264 profile/level)；无 ffprobe 时自动跳过
 }
 
 CHAR_NORMALIZATION_MAP = str.maketrans({
@@ -756,16 +755,14 @@ def deduplicate_candidate_entries(entries: Iterable[Dict[str, Any]]) -> List[Dic
 
 
 def _entry_sort_key(entry: Dict[str, Any]) -> Tuple[Any, ...]:
-    """单个条目的排序键：流畅度 -> 编码友好度 -> 吞吐带宽 -> 延迟 -> 是否 https -> URL 长度。"""
+    """单个条目的排序键：流畅度 -> 吞吐带宽 -> 延迟 -> 是否 https -> URL 长度。"""
     smooth = 1 if entry.get("smooth") else 0
-    encoding_ok = entry.get("encoding_ok")
-    encoding_rank = 1 if encoding_ok else (0 if encoding_ok is None else -1)
     throughput = entry.get("throughput_kbps")
     throughput = throughput if isinstance(throughput, (int, float)) else 0.0
     latency = entry.get("latency")
     latency = latency if isinstance(latency, (int, float)) else float("inf")
     https = 0 if str(entry.get("url", "")).startswith("https://") else 1
-    return (-smooth, -encoding_rank, -throughput, latency, https, len(str(entry.get("url", ""))))
+    return (-smooth, -throughput, latency, https, len(str(entry.get("url", ""))))
 
 
 def _pick_channel_name(entries: List[Dict[str, Any]]) -> str:
@@ -899,20 +896,16 @@ def _resolve_url(base_url: str, ref: str) -> str:
     return urljoin(base_url, ref)
 
 
-def _parse_m3u8_media(text: bytes, base_url: str) -> Tuple[Optional[float], Optional[str], Optional[float], Optional[str]]:
+def _parse_m3u8_media(text: bytes, base_url: str) -> Tuple[Optional[float], Optional[str], Optional[float]]:
     """
-    从 m3u8 播放列表里提取：(分片时长秒, 第一个分片绝对URL, 码率kbps, CODECS)。
-    变体列表(无直接分片)时返回 (None, None, 码率kbps, CODECS)。
+    从 m3u8 播放列表里提取：(分片时长秒, 第一个分片绝对URL, 码率kbps)。
+    变体列表(无直接分片)时返回 (None, None, 码率kbps)。
     """
     content = text.decode("utf-8", "ignore")
     bitrate_kbps = None
-    codecs = None
     m = re.search(r"BANDWIDTH=(\d+)", content, re.I)
     if m:
         bitrate_kbps = int(m.group(1)) / 1000.0
-    mc = re.search(r'CODECS="([^"]+)"', content, re.I)
-    if mc:
-        codecs = mc.group(1)
 
     duration = None
     segment = None
@@ -931,15 +924,15 @@ def _parse_m3u8_media(text: bytes, base_url: str) -> Tuple[Optional[float], Opti
             continue
         if saw_stream_inf:
             # 变体列表：第一个非注释行是子 m3u8，不作为媒体分片
-            return None, None, bitrate_kbps, codecs
+            return None, None, bitrate_kbps
         if pending is not None:
             duration = pending
         segment = line
         break
 
     if not segment:
-        return None, None, bitrate_kbps, codecs
-    return duration, _resolve_url(base_url, segment), bitrate_kbps, codecs
+        return None, None, bitrate_kbps
+    return duration, _resolve_url(base_url, segment), bitrate_kbps
 
 
 async def _read_until_error(response, n: int) -> bytes:
@@ -949,10 +942,9 @@ async def _read_until_error(response, n: int) -> bytes:
         return b""
 
 
-async def _measure_throughput(response) -> Tuple[Optional[float], bytes]:
-    """持续下载最多 probe_seconds 秒 / probe_max_bytes 字节，返回 (吞吐量kbps, 已下载字节)。"""
+async def _measure_throughput(response) -> Optional[float]:
+    """持续下载最多 probe_seconds 秒 / probe_max_bytes 字节，返回吞吐量 kbps。"""
     downloaded = 0
-    data = bytearray()
     dl_start = time.time()
     deadline = dl_start + CONFIG["probe_seconds"]
     while downloaded < CONFIG["probe_max_bytes"] and time.time() < deadline:
@@ -968,84 +960,10 @@ async def _measure_throughput(response) -> Tuple[Optional[float], bytes]:
         if not chunk:
             break
         downloaded += len(chunk)
-        data += chunk
     elapsed = time.time() - dl_start
     if elapsed <= 0:
         elapsed = 1e-6
-    return (downloaded * 8) / 1024 / elapsed, bytes(data)
-
-
-def _detect_h264_sps(data: bytes) -> Optional[Tuple[int, int]]:
-    """在 TS/裸流字节里找 H.264 SPS(NAL 0x67)，返回 (profile_idc, level_idc) 或 None。"""
-    idx = data.find(b"\x00\x00\x01\x67")
-    if idx < 0 or idx + 10 > len(data):
-        return None
-    # 起始码(4字节) + NAL头(0x67) 之后依次是 profile_idc、constraint、level_idc
-    return data[idx + 4], data[idx + 6]
-
-
-def _classify_h264(profile_idc: int, level_idc: int) -> bool:
-    """H.264 profile/level 是否硬件友好：1080p 出现高等级(>4.2)易触发部分硬解绿屏。"""
-    level = level_idc / 10.0
-    return level <= 4.2
-
-
-def _classify_codecs(codecs: Optional[str]) -> Optional[bool]:
-    """根据 CODECS 标签判断编码是否硬件友好：True=友好, False=不友好, None=未知。"""
-    if not codecs:
-        return None
-    m = re.search(r"(?i)\b(avc1|hev1|hvc1)\.([0-9a-fA-F.]+)", codecs)
-    if not m:
-        return None
-    kind = m.group(1).lower()
-    if kind == "avc1":
-        hexdigits = re.sub(r"[^0-9a-fA-F]", "", m.group(2))
-        if len(hexdigits) < 6:
-            return None
-        profile = int(hexdigits[0:2], 16)
-        level = int(hexdigits[4:6], 16)
-        return _classify_h264(profile, level)
-    # HEVC/H.265：应用对其走软解，无绿屏问题，视为友好
-    return True
-
-
-def _encoding_from_sps(data: bytes) -> Optional[bool]:
-    """从已下载的媒体字节里解析 H.264 SPS 判断硬件友好性。"""
-    sps = _detect_h264_sps(data)
-    if sps:
-        return _classify_h264(*sps)
-    return None
-
-
-async def _detect_encoding_ffprobe(data: bytes) -> Optional[bool]:
-    """用 ffprobe 探测编码是否硬件友好（可靠读取 profile/level）。ffprobe 不可用则返回 None。"""
-    if not CONFIG.get("use_ffprobe", True) or not data:
-        return None
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "ffprobe", "-v", "error", "-select_streams", "v:0",
-            "-show_entries", "stream=profile,level", "-of", "csv=p=0", "-",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        stdout, _ = await proc.communicate(data)
-        if proc.returncode != 0:
-            return None
-        for raw_line in stdout.decode("utf-8", "ignore").splitlines():
-            line = raw_line.strip()
-            if not line:
-                continue
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) >= 2 and parts[1].isdigit():
-                level = int(parts[1]) / 10.0
-                return level <= 4.2
-            return None
-        return None
-    except FileNotFoundError:
-        return None
-    except Exception:
-        return None
+    return (downloaded * 8) / 1024 / elapsed
 
 
 def _judge_smooth(throughput_kbps: Optional[float], bitrate_kbps: Optional[float]) -> bool:
@@ -1057,29 +975,26 @@ def _judge_smooth(throughput_kbps: Optional[float], bitrate_kbps: Optional[float
     return throughput_kbps >= CONFIG["min_smooth_kbps"]
 
 
-# 测试 IPTV 链接的可用性、延迟、流畅度和编码友好性
+# 测试 IPTV 链接的可用性、延迟和流畅度（吞吐带宽）
 async def test_stream(session: aiohttp.ClientSession, semaphore: asyncio.Semaphore, url: str):
-    """测试 IPTV 链接：返回 (是否可用, 延迟s, 吞吐kbps, 码率kbps, 编码是否硬件友好)。"""
+    """测试 IPTV 链接：返回 (是否可用, 延迟s, 吞吐kbps, 码率kbps)。"""
     async with semaphore:
         start_time = time.time()
         try:
             async with session.get(url, timeout=CONFIG["timeout"]) as response:
                 if response.status != 200:
-                    return False, None, None, None, None
+                    return False, None, None, None
                 content_type = response.headers.get("Content-Type", "")
                 chunk = await _read_until_error(response, 1024)
                 if _looks_like_error_payload(content_type, chunk):
-                    return False, None, None, None, None
+                    return False, None, None, None
                 latency = time.time() - start_time
 
                 is_m3u = ("mpegurl" in (content_type or "").lower()) or chunk.lstrip().startswith(b"#EXTM3U")
                 if not is_m3u:
-                    # 直接流：对源本身测吞吐，并尝试解析编码
-                    throughput, data = await _measure_throughput(response)
-                    encoding_ok = _encoding_from_sps(data)
-                    if encoding_ok is None:
-                        encoding_ok = await _detect_encoding_ffprobe(data)
-                    return True, latency, throughput, None, encoding_ok
+                    # 直接流：对源本身测吞吐
+                    throughput = await _measure_throughput(response)
+                    return True, latency, throughput, None
 
                 # m3u8：读完播放列表，再去测真实分片的下行速度
                 try:
@@ -1088,41 +1003,35 @@ async def test_stream(session: aiohttp.ClientSession, semaphore: asyncio.Semapho
                     rest = b""
                 playlist = chunk + rest
 
-            duration, seg_url, bitrate, codecs = _parse_m3u8_media(playlist, url)
-            encoding_ok = _classify_codecs(codecs)
+            duration, seg_url, bitrate = _parse_m3u8_media(playlist, url)
             if seg_url:
                 try:
                     async with session.get(seg_url, timeout=CONFIG["timeout"]) as r2:
                         if r2.status != 200:
-                            return False, None, None, None, None
+                            return False, None, None, None
                         h2 = await _read_until_error(r2, 1024)
                         if _looks_like_error_payload(r2.headers.get("Content-Type", ""), h2):
-                            return False, None, None, None, None
-                        throughput, data = await _measure_throughput(r2)
-                        if encoding_ok is None:
-                            encoding_ok = _encoding_from_sps(data)
-                        if encoding_ok is None:
-                            encoding_ok = await _detect_encoding_ffprobe(data)
-                        return True, latency, throughput, bitrate, encoding_ok
+                            return False, None, None, None
+                        throughput = await _measure_throughput(r2)
+                        return True, latency, throughput, bitrate
                 except Exception:
-                    return False, None, None, None, None
+                    return False, None, None, None
 
             # 变体列表无分片：对播放列表本身测速（不精确，但不至于误杀）
             try:
                 async with session.get(url, timeout=CONFIG["timeout"]) as r3:
                     if r3.status == 200:
-                        throughput, data = await _measure_throughput(r3)
-                        if encoding_ok is None:
-                            encoding_ok = _encoding_from_sps(data)
-                        return True, latency, throughput, bitrate, encoding_ok
+                        throughput = await _measure_throughput(r3)
+                        return True, latency, throughput, bitrate
             except Exception:
                 pass
-            return True, latency, None, bitrate, encoding_ok
+            return True, latency, None, bitrate
 
         except asyncio.TimeoutError:
-            return False, None, None, None, None
+            return False, None, None, None
         except Exception:
-            return False, None, None, None, None
+            return False, None, None, None
+
 
 
 # 测试多个 IPTV 链接
@@ -1161,7 +1070,7 @@ async def read_and_test_file(
 
         valid_entries: List[Dict[str, Any]] = []
         results = await test_multiple_streams(session, semaphore, entries)
-        for (is_valid, latency, throughput, bitrate, encoding_ok), entry in zip(results, entries):
+        for (is_valid, latency, throughput, bitrate), entry in zip(results, entries):
             if is_valid:
                 valid_entries.append({
                     "channel": entry["channel"],
@@ -1171,7 +1080,6 @@ async def read_and_test_file(
                     "latency": latency,
                     "throughput_kbps": throughput,
                     "bitrate_kbps": bitrate,
-                    "encoding_ok": encoding_ok,
                     "smooth": _judge_smooth(throughput, bitrate),
                 })
 
