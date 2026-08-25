@@ -1083,7 +1083,12 @@ if __name__ == "__main__":
         "https://raw.githubusercontent.com/Kimentanm/aptv/master/m3u/iptv.m3u",
         "https://raw.githubusercontent.com/BurningC4/Chinese-IPTV/master/TV-IPV4.m3u",
         "https://raw.githubusercontent.com/zwc456baby/iptv_alive/refs/heads/master/live.m3u",
-        "https://raw.githubusercontent.com/hujingguang/ChinaIPTV/main/cnTV_AutoUpdate.m3u8"
+        "https://raw.githubusercontent.com/hujingguang/ChinaIPTV/main/cnTV_AutoUpdate.m3u8",
+        "http://8.138.7.223/live.txt",
+        "https://ghfast.top/https://raw.githubusercontent.com/tianya7981/jiekou/refs/heads/main/%E9%87%8E%E7%81%AB959",
+        "http://tot.totalh.net/tttt.txt",
+        "https://raw.githubusercontent.com/YanG-1989/m3u/main/Gather.m3u",
+        "https://raw.githubusercontent.com/Ftindy/IPTV-URL/main/IPV6.m3u",
     ]
 
     # CCTV 频道文件（例如 IPTV/CCTV.txt）
