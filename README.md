@@ -1,3 +1,5 @@
+Origin from https://zilong7728.github.io/Collect-IPTV/
+
 ## 📡Collect-IPTV
 初始版本基于 DeepSeek 与 ChatGPT 生成，最新版本使用 Gemini 与 GPT-5.3-Codex 持续优化；依托 GitHub 服务器进行源地址可用性与延迟测试，网页已更新台标展示，并支持去重与优选低延迟最佳 URL，M3U 播放列表每 4 小时自动更新。
 > ⚠️ 特别说明：因使用 GitHub 服务器，**不保证国内网络环境下的链接速度与可用性**。  
@@ -12,4 +14,17 @@
 详细免责声明请参阅 [`DISCLAIMER.md`](./DISCLAIMER.md)。
 ---
 ## 📺️TV station list
-origin from https://zilong7728.github.io/Collect-IPTV/
+https://yangjb0913.github.io/Collect-IPTV/
+## ⏱️Last Run Time
+<!-- Last Run Time --> 2026-08-26 20:33:04 CST
+## 🔗Generated File Link
+<!-- Generated File Link --> [View Generated File](https://raw.githubusercontent.com/yangjb0913/Collect-IPTV/refs/heads/main/best_sorted.m3u)
+
+<!-- Generated File Link m3u8 --> [View Generated File](https://raw.githubusercontent.com/yangjb0913/Collect-IPTV/refs/heads/main/best_sorted.m3u8)
+## 💡 使用说明
+1. 点击上方「下载 M3U/M3U8 文件」获取最新节目源
+2. 将文件导入支持 IPTV 的播放器（如 Kodi、PotPlayer、Perfect Player 等）
+3. 节目源每 4 小时自动更新，建议定期重新下载
+## ⭐️Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=yangjb0913/Collect-IPTV&type=Date)](https://star-history.com/#yangjb0913/Collect-IPTV&Date)
