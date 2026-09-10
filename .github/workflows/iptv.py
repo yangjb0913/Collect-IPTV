@@ -1085,6 +1085,7 @@ if __name__ == "__main__":
         "https://raw.githubusercontent.com/zwc456baby/iptv_alive/refs/heads/master/live.m3u",
         "https://raw.githubusercontent.com/hujingguang/ChinaIPTV/main/cnTV_AutoUpdate.m3u8",
         "https://raw.githubusercontent.com/iptv-org/iptv/master/streams/cn.m3u",
+        "https://gh-proxy.com/https://raw.githubusercontent.com/mursor1985/LIVE/refs/heads/main/yylunbo.m3u"
     ]
 
     # CCTV 频道文件（例如 IPTV/CCTV.txt）
