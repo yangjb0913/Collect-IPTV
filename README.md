@@ -16,7 +16,7 @@ Origin from https://zilong7728.github.io/Collect-IPTV/
 ## 📺️TV station list
 https://yangjb0913.github.io/Collect-IPTV/
 ## ⏱️Last Run Time
-<!-- Last Run Time --> 2026-09-23 11:57:57 CST
+<!-- Last Run Time --> 2026-09-23 17:17:13 CST
 ## 🔗Generated File Link
 <!-- Generated File Link --> [View Generated File](https://raw.githubusercontent.com/yangjb0913/Collect-IPTV/refs/heads/main/best_sorted.m3u)
 
